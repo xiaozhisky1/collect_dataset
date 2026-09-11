@@ -6,7 +6,7 @@ import numpy as np
 import argparse
 from tqdm import tqdm
 
-TARGET_SIZE = (224, 224)   # 统一图像尺寸
+TARGET_SIZE = (256, 256)   # 统一图像尺寸
 
 def list_steps(episode_dir):
     img_root = os.path.join(episode_dir, "images")
@@ -94,8 +94,8 @@ def main(dataset_root, output_h5):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_root", default="data/20250825_141651/dataset",
+    parser.add_argument("--dataset_root", default="data/real_stack_block_5/dataset",
                         help="例如 data/20250825_xxxx/dataset")
-    parser.add_argument("--output_h5", default="real_stack_block.hdf5")
+    parser.add_argument("--output_h5", default="real_stack_block_5.hdf5")
     args = parser.parse_args()
     main(args.dataset_root, args.output_h5)

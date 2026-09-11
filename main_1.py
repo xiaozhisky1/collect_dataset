@@ -8,6 +8,7 @@ import jkrc
 import time
 import argparse
 from spacemouse import Spacemouse
+import shutil
 
 # === 初始位姿与回零函数 ===
 HOME_JOINTS = [
@@ -31,7 +32,7 @@ def move_robot_to_home(robot, speed=0.2):
             robot.servo_move_enable(False)
         except Exception:
             pass
-
+        robot.set_digital_output(0, 0, 0)
         # coord=0(基坐标)，is_block=True(阻塞到位)，speed 为关节空间速度
         ret = robot.joint_move(HOME_JOINTS, 0, True, speed)
         # 兼容 jkrc 返回 (errcode, ...) 的形式
@@ -44,7 +45,7 @@ def move_robot_to_home(robot, speed=0.2):
             time.sleep(5)
         except Exception:
             pass
-
+    return True
 
 def initialize_camera(serial_number, width=640, height=480, fps=30):
     pipeline = rs.pipeline()
@@ -99,7 +100,22 @@ def get_next_episode_number(output_folder):
         return 1
     episode_numbers = [int(d.split("_")[1]) for d in existing_episodes]
     return max(episode_numbers) + 1
-
+def clear_episode_folder(dataset_root, episode_num):
+    """
+    删除当前 episode 文件夹（含 images 与 robot_data），用于重新采集。
+    """
+    episode_folder = os.path.join(dataset_root, f"episode_{episode_num}")
+    try:
+        if os.path.exists(episode_folder):
+            shutil.rmtree(episode_folder, ignore_errors=True)
+            # 若你希望立即重建空文件夹，也可以取消下面两行注释
+            # os.makedirs(os.path.join(episode_folder, "images"), exist_ok=True)
+            # os.makedirs(os.path.join(episode_folder, "robot_data"), exist_ok=True)
+            print(f"[Redo] 已清空 {episode_folder}")
+        else:
+            print(f"[Redo] {episode_folder} 不存在，无需清理")
+    except Exception as e:
+        print(f"[Redo][WARN] 清理 {episode_folder} 失败：{e}")
 def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False):
     program_start_time = time.time()
 
@@ -197,7 +213,7 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
 
             # === SpaceMouse 输入 ===
             motion = spacemouse.get_motion_state_transformed()
-            translation = motion[:3] * 5.0
+            translation = motion[:3] * 8.0
 
             # —— 旋转模式：按键切换（SpaceMouse Btn1 或键盘 R）
             btn1 = spacemouse.is_button_pressed(1)
@@ -209,7 +225,7 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
 
             # 根据开关决定是否应用旋转
             if rotation_enabled:
-                rotation = motion[3:] * 0.01
+                rotation = motion[3:] * 0.02
             else:
                 rotation = np.zeros(3, dtype=np.float32)
 
@@ -222,7 +238,7 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                 time.sleep(sleep_time)
                 continue
             tcp_pose = result[1]  # 长度6
-
+            new_pose=None
             # === 仅当增量非零才下发运动指令（直接判断是否为 0） ===
             if not (np.all(translation == 0) and np.all(rotation == 0)):
                 new_pose = list(tcp_pose)
@@ -253,6 +269,10 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                 continue
             joint_angles = ret[1]
             tcp_pose = robot.get_tcp_position()
+            if new_pose is not None:
+                print("save_count:", save_count)
+                print(tcp_pose[1])
+                print(new_pose)
             tcp_data = tcp_pose[1] if tcp_pose[0] == 0 else None
 
             # 转 numpy & 可视化深度
@@ -350,7 +370,7 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                 print("收到退出(q)，停止采集。")
                 break
             if key == ord('c'):
-                # 新开一条演示/轨迹
+                # 新开一条演示/轨迹（递增 episode 号）
                 max_episode_num = get_next_episode_number(dataset_root)
                 frame_count = 0
                 save_count = 0
@@ -361,7 +381,30 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                 print(f"正在采集第 {max_episode_num} 条轨迹（已重置计数）")
 
                 # 开始新一条采集前，回到初始位姿
-                move_robot_to_home(robot)
+                gripper_open = move_robot_to_home(robot)
+
+            if key == ord('r'):
+                # 重新收集当前这条轨迹（不递增 episode 号）：清空当前 episode 已采集的数据并复位
+                try:
+                    clear_episode_folder(dataset_root, max_episode_num)
+                except Exception as e:
+                    print(f"[Redo][ERROR] 清理当前 episode 失败：{e}")
+
+                # 计数与去重状态全部复位
+                frame_count = 0
+                save_count = 0
+                last_saved_tcp = None
+                last_saved_gripper = None
+                first_saved_in_episode = False
+
+                # 回到初始位姿，重新开始本 episode
+                try:
+                    gripper_open = move_robot_to_home(robot)
+                except Exception as e:
+                    print(f"[Redo][WARN] 回初始位姿失败：{e}")
+
+                print(f"[Redo] 已重置并准备重新采集第 {max_episode_num} 条轨迹")
+
 
             # 控制频率：睡眠补偿
             elapsed_time = time.time() - start_time
@@ -415,8 +458,8 @@ if __name__ == "__main__":
     # 兼容旧参数：--target_fps 等价于 --control_hz
     parser.add_argument("--target_fps", type=int, help="【兼容参数】控制频率（等价于 --control_hz）", default=None)
 
-    parser.add_argument("--control_hz", type=int, help="控制频率（Hz）", default=15)
-    parser.add_argument("--save_hz", type=int, help="保存频率（Hz）", default=15)
+    parser.add_argument("--control_hz", type=int, help="控制频率（Hz）", default=20)
+    parser.add_argument("--save_hz", type=int, help="保存频率（Hz）", default=10)
 
     # 为了更稳妥地接收布尔类型，这里将字符串 true/false 映射为布尔
     def str2bool(v):
