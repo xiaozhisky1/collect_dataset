@@ -1,3 +1,4 @@
+# python hdf5_point.py   --dataset_root /home/rookie/collect/data/fruit_wxy/dataset   --camera_param /home/rookie/collect/data/fruit_wxy/parameters/camera_937622072591_params.json   --output_h5 pointcloud_front.hdf5   --viz_demo 0 --viz_frame 0
 import pyrealsense2 as rs
 import numpy as np
 import cv2
@@ -342,6 +343,39 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                     # 其他情况 → 一律保存
                     need_save = True
 
+                # if need_save:
+                #     save_count += 1
+                #     episode_folder = os.path.join(dataset_root, f"episode_{max_episode_num}")
+                #     dataset_folder = os.path.join(episode_folder, "images")
+                #     robot_data_folder = os.path.join(episode_folder, "robot_data")
+                #     os.makedirs(dataset_folder, exist_ok=True)
+                #     os.makedirs(robot_data_folder, exist_ok=True)
+                #
+                #     timestep_folder = os.path.join(dataset_folder, str(save_count))
+                #     os.makedirs(timestep_folder, exist_ok=True)
+                #
+                #     cv2.imwrite(os.path.join(timestep_folder, "camera1_rgb.png"), c1_rgb_256)
+                #     cv2.imwrite(os.path.join(timestep_folder, "camera1_depth.png"), d1_vis_256)
+                #     cv2.imwrite(os.path.join(timestep_folder, "camera2_rgb.png"), c2_rgb_256)
+                #     cv2.imwrite(os.path.join(timestep_folder, "camera2_depth.png"), d2_vis_256)
+                #
+                #     robot_subfolder = os.path.join(robot_data_folder, str(save_count))
+                #     os.makedirs(robot_subfolder, exist_ok=True)
+                #     robot_data = {
+                #         "timestamp": datetime.now().isoformat(),
+                #         "joint_angles": joint_angles,
+                #         "tcp_pose": tcp_data,
+                #         # 统一保存语义：0=张开，1=闭合
+                #         "gripper": current_gripper_int,
+                #     }
+                #     with open(os.path.join(robot_subfolder, "robot_data.json"), 'w') as f:
+                #         json.dump(robot_data, f, indent=4)
+                #
+                #     # 更新“上一已保存状态”
+                #     last_saved_tcp = tcp_data[:] if tcp_data is not None else None
+                #     last_saved_gripper = current_gripper_int
+                #     first_saved_in_episode = True
+                # # else: 跳过保存
                 if need_save:
                     save_count += 1
                     episode_folder = os.path.join(dataset_root, f"episode_{max_episode_num}")
@@ -353,11 +387,47 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                     timestep_folder = os.path.join(dataset_folder, str(save_count))
                     os.makedirs(timestep_folder, exist_ok=True)
 
-                    cv2.imwrite(os.path.join(timestep_folder, "camera1_rgb.png"), c1_rgb_256)
-                    cv2.imwrite(os.path.join(timestep_folder, "camera1_depth.png"), d1_vis_256)
-                    cv2.imwrite(os.path.join(timestep_folder, "camera2_rgb.png"), c2_rgb_256)
-                    cv2.imwrite(os.path.join(timestep_folder, "camera2_depth.png"), d2_vis_256)
+                    # === 相机图像预处理与缩放（保存为 256x256） ===
+                    RGB_SIZE = (256, 256)
+                    DEPTH_SIZE = (256, 256)
+                    c1_rgb_256 = cv2.resize(color_image_1, RGB_SIZE, interpolation=cv2.INTER_AREA)
+                    c2_rgb_256 = cv2.resize(color_image_2, RGB_SIZE, interpolation=cv2.INTER_AREA)
 
+                    # # === 深度图保存部分修改 ===
+                    # # 原始深度（uint16，单位 mm）
+                    # d1_depth_raw = cv2.resize(depth_image_1, DEPTH_SIZE, interpolation=cv2.INTER_NEAREST)
+                    # d2_depth_raw = cv2.resize(depth_image_2, DEPTH_SIZE, interpolation=cv2.INTER_NEAREST)
+                    #
+                    # # 可视化深度（8-bit 彩色，用 colorizer 渲染）
+                    # d1_depth_vis = cv2.resize(np.asanyarray(colorizer.colorize(depth_frame_1).get_data()), DEPTH_SIZE,
+                    #                           interpolation=cv2.INTER_NEAREST)
+                    # d2_depth_vis = cv2.resize(np.asanyarray(colorizer.colorize(depth_frame_2).get_data()), DEPTH_SIZE,
+                    #                           interpolation=cv2.INTER_NEAREST)
+                    # 正确保存原始深度（uint16, mm）
+                    d1_depth_raw = cv2.resize(np.asanyarray(depth_frame_1.get_data()), DEPTH_SIZE,
+                                              interpolation=cv2.INTER_NEAREST)
+                    d2_depth_raw = cv2.resize(np.asanyarray(depth_frame_2.get_data()), DEPTH_SIZE,
+                                              interpolation=cv2.INTER_NEAREST)
+
+                    # 可视化深度（彩色）
+                    d1_depth_vis = cv2.resize(np.asanyarray(colorizer.colorize(depth_frame_1).get_data()), DEPTH_SIZE,
+                                              interpolation=cv2.INTER_NEAREST)
+                    d2_depth_vis = cv2.resize(np.asanyarray(colorizer.colorize(depth_frame_2).get_data()), DEPTH_SIZE,
+                                              interpolation=cv2.INTER_NEAREST)
+
+                    # === 保存相机图像 ===
+                    cv2.imwrite(os.path.join(timestep_folder, "camera1_rgb.png"), c1_rgb_256)
+                    cv2.imwrite(os.path.join(timestep_folder, "camera2_rgb.png"), c2_rgb_256)
+
+                    # 保存真实深度 (16-bit PNG)
+                    cv2.imwrite(os.path.join(timestep_folder, "camera1_depth.png"), d1_depth_raw)
+                    cv2.imwrite(os.path.join(timestep_folder, "camera2_depth.png"), d2_depth_raw)
+
+                    # 保存可视化深度 (8-bit 彩色 PNG)
+                    cv2.imwrite(os.path.join(timestep_folder, "camera1_depth_vis.png"), d1_depth_vis)
+                    cv2.imwrite(os.path.join(timestep_folder, "camera2_depth_vis.png"), d2_depth_vis)
+
+                    # === 保存机器人数据 ===
                     robot_subfolder = os.path.join(robot_data_folder, str(save_count))
                     os.makedirs(robot_subfolder, exist_ok=True)
                     robot_data = {
@@ -374,7 +444,6 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                     last_saved_tcp = tcp_data[:] if tcp_data is not None else None
                     last_saved_gripper = current_gripper_int
                     first_saved_in_episode = True
-                # else: 跳过保存
 
             # 按键处理
             key = cv2.waitKey(1) & 0xFF

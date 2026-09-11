@@ -315,20 +315,18 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                 c2_rgb_256 = cv2.resize(color_image_2, RGB_SIZE, interpolation=cv2.INTER_AREA)
                 d2_vis_256 = cv2.resize(depth_image_2, DEPTH_SIZE, interpolation=cv2.INTER_NEAREST)
 
-                # —— 判断是否需要保存：
                 current_gripper_int = 0 if gripper_open else 1
+
+                # === 修改后的保存条件 ===
                 if not first_saved_in_episode:
-                    need_save = True
-                else:
-                    # 抓夹或位姿只要有任一不同就保存；直接相等比较
-                    gripper_changed = (current_gripper_int != last_saved_gripper)
-                    pose_changed = False
-                    if tcp_data is None or last_saved_tcp is None:
-                        pose_changed = True
+                    # episode 第一次保存 → 只有 motion 全零时才跳过
+                    if np.all(translation == 0) and np.all(rotation == 0):
+                        need_save = False
                     else:
-                        # 直接比较完整序列是否完全相等
-                        pose_changed = tuple(tcp_data) != tuple(last_saved_tcp)
-                    need_save = gripper_changed or pose_changed
+                        need_save = True
+                else:
+                    # 其他情况 → 一律保存
+                    need_save = True
 
                 if need_save:
                     save_count += 1

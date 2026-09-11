@@ -51,7 +51,7 @@ robot = initialize_robot()
 
 last_grip = None  # 模型输出的 0/1 标志；0=打开，1=闭合
 
-with h5py.File(f"data/real_stack_block_2/real_stack_block_2.hdf5") as file:
+with h5py.File(f"data/real_stack_block_5/real_stack_block_5.hdf5") as file:
     # count total steps
     demos = file['data']  # 打开 HDF5 文件并读取数据
     for i in range(50):

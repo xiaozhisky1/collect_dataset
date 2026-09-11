@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="dp_rlbench" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="dp_rlbench" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="dp_collect" project-jdk-type="Python SDK" />
 </project>

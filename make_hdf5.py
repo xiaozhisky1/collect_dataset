@@ -8,6 +8,18 @@ from tqdm import tqdm
 
 TARGET_SIZE = (256, 256)   # 统一图像尺寸
 
+def pad_last_dim_to(x: np.ndarray, target_dim: int, pad_value: float = 0.0) -> np.ndarray:
+    if x.ndim == 0:
+        raise ValueError("pad_last_dim_to expects an array with at least 1 dimension")
+    last_dim = x.shape[-1]
+    if last_dim == target_dim:
+        return x
+    if last_dim > target_dim:
+        raise ValueError(f"Cannot pad last dim from {last_dim} to smaller target_dim={target_dim}")
+    pad_width = [(0, 0)] * x.ndim
+    pad_width[-1] = (0, target_dim - last_dim)
+    return np.pad(x, pad_width=pad_width, mode="constant", constant_values=pad_value)
+
 def list_steps(episode_dir):
     img_root = os.path.join(episode_dir, "images")
     rob_root = os.path.join(episode_dir, "robot_data")
@@ -37,7 +49,7 @@ def read_robot_json(path):
     grip = np.asarray([float(grip)], dtype=np.float32)
     return np.concatenate([tcp, grip], axis=0).astype(np.float32)  # (7,)
 
-def load_episode(ep_dir):
+def load_episode(ep_dir, pad: bool = False):
     steps = list_steps(ep_dir)
     if not steps:
         raise RuntimeError(f"No steps in {ep_dir}")
@@ -62,9 +74,13 @@ def load_episode(ep_dir):
         action[:-1] = qpos[1:]
         action[-1]  = action[-2]
 
+    if pad:
+        qpos = pad_last_dim_to(qpos, 8, pad_value=0.0).astype(np.float32, copy=False)
+        action = pad_last_dim_to(action, 8, pad_value=0.0).astype(np.float32, copy=False)
+
     return front, wrist, qpos, action
 
-def main(dataset_root, output_h5):
+def main(dataset_root, output_h5, pad: bool = False):
     episodes = sorted([d for d in os.listdir(dataset_root) if d.startswith("episode_")],
                       key=lambda x: int(x.split("_")[1]))
     if not episodes:
@@ -76,7 +92,7 @@ def main(dataset_root, output_h5):
 
         for idx, ep in enumerate(tqdm(episodes, desc="Converting")):
             ep_dir = os.path.join(dataset_root, ep)
-            front, wrist, qpos, action = load_episode(ep_dir)
+            front, wrist, qpos, action = load_episode(ep_dir, pad=pad)
 
             demo = data_group.create_group(f"demo_{idx}")
             obs  = demo.create_group("obs")
@@ -94,8 +110,10 @@ def main(dataset_root, output_h5):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_root", default="data/real_stack_block_5/dataset",
+    parser.add_argument("--dataset_root", default="data/real_long_new_gripper_1/dataset",
                         help="例如 data/20250825_xxxx/dataset")
-    parser.add_argument("--output_h5", default="real_stack_block_5.hdf5")
+    parser.add_argument("--output_h5", default="data/real_long_new_gripper_1/real_long_new_gripper_1.hdf5")
+    parser.add_argument("--pad", action="store_true",
+                        help="是否把 qpos/action 的最后一维 padding 到 8（不足补 0）")
     args = parser.parse_args()
-    main(args.dataset_root, args.output_h5)
+    main(args.dataset_root, args.output_h5, pad=args.pad)

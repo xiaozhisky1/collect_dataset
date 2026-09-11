@@ -47,13 +47,25 @@ def move_robot_to_home(robot, speed=0.2):
             pass
     return True
 
-def initialize_camera(serial_number, width=640, height=480, fps=30):
+def initialize_camera(serial_number, width=640, height=480, fps=30, manual_exposure=None):
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_device(serial_number)
     config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
     config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
     profile = pipeline.start(config)
+    try:
+        color_sensor = profile.get_device().first_color_sensor()
+        if manual_exposure is not None:
+            color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+            color_sensor.set_option(rs.option.exposure, float(manual_exposure))
+            print(f"[Camera {serial_number}] 手动曝光已设置为 {manual_exposure}")
+        else:
+            # 显式恢复自动曝光，避免沿用设备上一次手动曝光值
+            color_sensor.set_option(rs.option.enable_auto_exposure, 1)
+            print(f"[Camera {serial_number}] 已启用自动曝光")
+    except Exception as e:
+        print(f"[Camera {serial_number}] 设置曝光模式失败：{e}")
     return pipeline, profile
 
 def save_camera_parameters(profile, serial_number, output_folder):
@@ -116,7 +128,8 @@ def clear_episode_folder(dataset_root, episode_num):
             print(f"[Redo] {episode_folder} 不存在，无需清理")
     except Exception as e:
         print(f"[Redo][WARN] 清理 {episode_folder} 失败：{e}")
-def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False):
+def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False,
+         manual_exposure=None, manual_exposure_1=None, manual_exposure_2=None):
     program_start_time = time.time()
 
     # 目录初始化
@@ -139,8 +152,11 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
     print(f"Camera 1 Serial: {serial_1}")
     print(f"Camera 2 Serial: {serial_2}")
 
-    pipeline_1, profile_1 = initialize_camera(serial_1)
-    pipeline_2, profile_2 = initialize_camera(serial_2)
+    cam1_exposure = manual_exposure_1 if manual_exposure_1 is not None else manual_exposure
+    cam2_exposure = manual_exposure_2 if manual_exposure_2 is not None else manual_exposure
+
+    pipeline_1, profile_1 = initialize_camera(serial_1, manual_exposure=cam1_exposure)
+    pipeline_2, profile_2 = initialize_camera(serial_2, manual_exposure=cam2_exposure)
 
     save_camera_parameters(profile_1, serial_1, base_folder)
     save_camera_parameters(profile_2, serial_2, base_folder)
@@ -472,6 +488,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--control_hz", type=int, help="控制频率（Hz）", default=20)
     parser.add_argument("--save_hz", type=int, help="保存频率（Hz）", default=10)
+    parser.add_argument("--manual_exposure", type=float, default=None,
+                        help="两路相机统一手动曝光值（兼容参数）")
+    parser.add_argument("--manual_exposure_1", type=float, default=None,
+                        help="相机1手动曝光值（优先级高于 --manual_exposure）120/400-450")
+    parser.add_argument("--manual_exposure_2", type=float, default=None,
+                        help="相机2手动曝光值（优先级高于 --manual_exposure）80-100/250")
 
     # 为了更稳妥地接收布尔类型，这里将字符串 true/false 映射为布尔
     def str2bool(v):
@@ -490,4 +512,7 @@ if __name__ == "__main__":
     main(output_folder=args.output_folder,
          control_hz=args.control_hz,
          save_hz=args.save_hz,
-         continue_getdata=args.continue_getdata)
+         continue_getdata=args.continue_getdata,
+         manual_exposure=args.manual_exposure,
+         manual_exposure_1=args.manual_exposure_1,
+         manual_exposure_2=args.manual_exposure_2)

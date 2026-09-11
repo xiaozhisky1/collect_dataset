@@ -1,14 +1,17 @@
-import pyrealsense2 as rs
 import numpy as np
 import cv2
 import os
 import json
 from datetime import datetime
-import jkrc
 import time
 import argparse
 from spacemouse import Spacemouse
+import pyrealsense2 as rs
+import jkrc
+import threading
+
 import shutil
+from scs_controller import MultiAngleServoController
 
 # === 初始位姿与回零函数 ===
 HOME_JOINTS = [
@@ -19,12 +22,15 @@ HOME_JOINTS = [
     1.574945146395447,
     0.8625550837790502,
 ]
+# MIN_TCP_Z = 275.0
 
-def move_robot_to_home(robot, speed=0.2):
+
+def move_robot_to_home(robot, gripper_controller=None, speed=0.2):
     """
     在发起数据采集前调用，使机械臂回到既定关节初始位姿。
     - 为避免与 servo_p 冲突：回零前临时关闭伺服模式，回零后再打开。
     - speed: 关节移动速度（请按控制器标准设定）
+    - gripper_controller: 抓夹舵机控制器（可选），如果提供则在回零时打开抓夹
     """
     try:
         # 关闭伺服以避免与 joint_move 冲突
@@ -32,7 +38,24 @@ def move_robot_to_home(robot, speed=0.2):
             robot.servo_move_enable(False)
         except Exception:
             pass
-        robot.set_digital_output(0, 0, 0)
+
+        # 使用舵机控制抓夹打开，如果提供了控制器
+        # 回零场景使用阻塞模式，避免因上一次非阻塞线程未结束而被跳过。
+        if gripper_controller is not None:
+            try:
+                # opened = control_gripper(gripper_controller, open=True, blocking=True)
+                opened = True
+                if opened is False:
+                    print("[WARN] 回零时抓夹打开指令返回失败")
+            except Exception as e:
+                print(f"[WARN] 回零时打开抓夹失败：{e}")
+        else:
+            # 兼容旧代码：如果没有提供舵机控制器，尝试使用IO控制
+            try:
+                robot.set_digital_output(0, 0, 0)
+            except Exception:
+                pass
+
         # coord=0(基坐标)，is_block=True(阻塞到位)，speed 为关节空间速度
         ret = robot.joint_move(HOME_JOINTS, 0, True, speed)
         # 兼容 jkrc 返回 (errcode, ...) 的形式
@@ -47,6 +70,7 @@ def move_robot_to_home(robot, speed=0.2):
             pass
     return True
 
+
 def initialize_camera(serial_number, width=640, height=480, fps=30):
     pipeline = rs.pipeline()
     config = rs.config()
@@ -55,6 +79,7 @@ def initialize_camera(serial_number, width=640, height=480, fps=30):
     config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
     profile = pipeline.start(config)
     return pipeline, profile
+
 
 def save_camera_parameters(profile, serial_number, output_folder):
     color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
@@ -82,6 +107,7 @@ def save_camera_parameters(profile, serial_number, output_folder):
     with open(json_path, 'w') as f:
         json.dump(params, f, indent=4)
 
+
 def initialize_robot(ip="10.5.5.100"):
     robot = jkrc.RC(ip)
     ret = robot.login()
@@ -92,6 +118,90 @@ def initialize_robot(ip="10.5.5.100"):
         raise Exception(f"Robot login failed, error code: {ret[0]}")
     return robot
 
+
+def initialize_gripper(port='/dev/ttyUSB0', baudrate=1000000, servo_ids=[1]):
+    """
+    初始化舵机控制的抓夹
+
+    Args:
+        port: 串口地址 (Windows下如 'COM3', Linux下如 '/dev/ttyUSB0')
+        baudrate: 串口波特率 (如 1000000)
+        servo_ids: 舵机ID列表
+
+    Returns:
+        MultiAngleServoController: 舵机控制器实例
+    """
+    print(f"[Gripper] 正在初始化舵机控制器: Port={port}, Baudrate={baudrate}, ServoIDs={servo_ids}")
+    gripper_controller = MultiAngleServoController(
+        comm_address=port,
+        comm_port=baudrate,
+        servo_ids=servo_ids
+    )
+
+    if not gripper_controller.connect():
+        raise Exception("抓夹舵机连接失败！请检查串口连接和参数设置。")
+
+    print(f"[Gripper] 抓夹舵机连接成功！")
+    return gripper_controller
+
+
+# 全局变量：跟踪正在执行的抓夹控制线程
+_gripper_thread = None
+_gripper_thread_lock = threading.Lock()
+
+
+def control_gripper(gripper_controller, open: bool, servo_id=1, blocking=False):
+    """
+    控制抓夹张开或闭合（默认非阻塞）
+
+    Args:
+        gripper_controller: MultiAngleServoController 实例
+        open: True=张开, False=闭合
+        servo_id: 舵机ID（默认为1）
+        blocking: 是否阻塞等待完成（默认False，非阻塞）
+
+    Returns:
+        bool: 是否成功启动（非阻塞模式下立即返回True，阻塞模式下返回实际执行结果）
+    """
+    global _gripper_thread
+    
+    # 角度映射：30°=张开, 90°=闭合
+    target_angle = 15.0 if open else 90.0
+    
+    def _gripper_worker():
+        """后台线程执行抓夹控制"""
+        try:
+            gripper_controller.move_single_servo_with_load(servo_id, target_angle)
+            print(f"[Gripper] 抓夹控制完成：{'打开' if open else '关闭'}")
+        except Exception as e:
+            print(f"[ERROR] 抓夹控制失败：{e}")
+        finally:
+            # 清除线程引用
+            with _gripper_thread_lock:
+                global _gripper_thread
+                _gripper_thread = None
+    
+    # 如果阻塞模式，直接执行
+    if blocking:
+        try:
+            return gripper_controller.move_single_servo_with_load(servo_id, target_angle)
+        except Exception as e:
+            print(f"[ERROR] 抓夹控制失败：{e}")
+            return False
+    
+    # 非阻塞模式：检查是否有正在执行的线程
+    with _gripper_thread_lock:
+        if _gripper_thread is not None and _gripper_thread.is_alive():
+            print(f"[WARN] 抓夹正在运动中，跳过本次指令")
+            return False
+        
+        # 启动新线程
+        _gripper_thread = threading.Thread(target=_gripper_worker, daemon=True)
+        _gripper_thread.start()
+        print(f"[Gripper] 抓夹控制已启动（非阻塞）：{'打开' if open else '关闭'}")
+        return True
+
+
 def get_next_episode_number(output_folder):
     if not os.path.exists(output_folder):
         return 1
@@ -100,6 +210,8 @@ def get_next_episode_number(output_folder):
         return 1
     episode_numbers = [int(d.split("_")[1]) for d in existing_episodes]
     return max(episode_numbers) + 1
+
+
 def clear_episode_folder(dataset_root, episode_num):
     """
     删除当前 episode 文件夹（含 images 与 robot_data），用于重新采集。
@@ -116,7 +228,10 @@ def clear_episode_folder(dataset_root, episode_num):
             print(f"[Redo] {episode_folder} 不存在，无需清理")
     except Exception as e:
         print(f"[Redo][WARN] 清理 {episode_folder} 失败：{e}")
-def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False):
+
+
+def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False,
+         gripper_port='/dev/ttyUSB0', gripper_baudrate=1000000, gripper_servo_ids=[1]):
     program_start_time = time.time()
 
     # 目录初始化
@@ -148,8 +263,20 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
     # 机器人
     robot = initialize_robot()
 
+    # 抓夹舵机控制器初始化
+    try:
+        gripper_controller = initialize_gripper(
+            port=gripper_port,
+            baudrate=gripper_baudrate,
+            servo_ids=gripper_servo_ids
+        )
+    except Exception as e:
+        print(f"[ERROR] 抓夹舵机初始化失败：{e}")
+        print("[WARN] 程序将继续运行，但抓夹控制将不可用")
+        gripper_controller = None
+
     # 在开始采集第 1 条轨迹之前回到初始位姿
-    move_robot_to_home(robot)
+    move_robot_to_home(robot, gripper_controller)
 
     # SpaceMouse
     spacemouse = Spacemouse(deadzone=0.3)
@@ -168,22 +295,31 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
     os.makedirs(dataset_root, exist_ok=True)
     max_episode_num = get_next_episode_number(dataset_root)
 
-    # 夹爪状态机（统一约定：IO 0=张开，1=闭合）
+    # 夹爪状态机（统一约定：0=张开，1=闭合）
     gripper_open = True  # True=张开, False=闭合
     last_btn0 = False
     last_btn1 = False
-    rotation_enabled = False
+    # 旋转三态循环：0=禁用旋转, 1=仅保留rz, 2=全旋转
+    rotation_mode = 0
 
     try:
-        # 初始：张开 => IO 输出 0
-        robot.set_digital_output(0, 0, 0 if gripper_open else 1)
+        # 初始：张开抓夹（使用舵机控制）
+        if gripper_controller is not None:
+            control_gripper(gripper_controller, open=True)
+            print("[Gripper] 初始状态：打开")
+        else:
+            # 兼容旧代码：如果没有舵机控制器，尝试使用IO控制
+            try:
+                robot.set_digital_output(0, 0, 0 if gripper_open else 1)
+            except Exception as e:
+                print(f"[WARN] 初始化抓夹IO失败：{e}")
     except Exception as e:
-        print(f"[WARN] 初始化抓夹IO失败：{e}")
+        print(f"[WARN] 初始化抓夹失败：{e}")
 
     # 保存去重需要的“上一已保存状态”
-    last_saved_tcp = None          # list/tuple of 6
-    last_saved_gripper = None      # 0=open, 1=close
-    first_saved_in_episode = False # 本 episode 是否已保存过第一帧
+    last_saved_tcp = None  # list/tuple of 6
+    last_saved_gripper = None  # 0=open, 1=close
+    first_saved_in_episode = False  # 本 episode 是否已保存过第一帧
 
     # 统一窗口创建
     cv2.namedWindow('Dual RealSense D435i Feeds', cv2.WINDOW_NORMAL)
@@ -191,6 +327,7 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
     # 计数器
     frame_count = 0
     save_count = 0
+    action_count = 0
 
     try:
         while True:
@@ -215,16 +352,21 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
             motion = spacemouse.get_motion_state_transformed()
             translation = motion[:3] * 8.0
 
-            # —— 旋转模式：按键切换（SpaceMouse Btn1 或键盘 R）
+            # —— 旋转模式：Btn1 三态循环（禁用 -> 仅rz -> 全旋转 -> 禁用）
             btn1 = spacemouse.is_button_pressed(1)
             # 上升沿触发切换
             if btn1 and not last_btn1:
-                rotation_enabled = not rotation_enabled
-                print(f"[Rotation] {'ENABLED' if rotation_enabled else 'LOCKED'} (toggled by Btn1)")
+                rotation_mode = (rotation_mode + 1) % 3
+                if rotation_mode == 0:
+                    print("[Rotation] LOCKED (disabled) [Btn1 cycle]")
+                elif rotation_mode == 1:
+                    print("[Rotation] RZ_ONLY (keep rz only) [Btn1 cycle]")
+                else:
+                    print("[Rotation] FULL (rx, ry, rz) [Btn1 cycle]")
             last_btn1 = btn1
 
-            # 根据开关决定是否应用旋转
-            if rotation_enabled:
+            # 根据三态模式决定是否应用旋转
+            if rotation_mode == 2:
                 # 取出原始旋转量
                 rx, ry, rz = motion[3:]
 
@@ -237,6 +379,10 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                 rx_new, ry_new = rot_matrix @ np.array([rx, ry])
 
                 rotation = np.array([rx_new, ry_new, rz]) * 0.04
+            elif rotation_mode == 1:
+                # 仅保留 rz
+                rz = motion[5]
+                rotation = np.array([0.0, 0.0, rz]) * 0.04
             else:
                 rotation = np.zeros(3, dtype=np.float32)
 
@@ -258,19 +404,35 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                 for i in range(3):
                     new_pose[i] += float(translation[i])
                     new_pose[i + 3] += float(rotation[i])
+                # new_pose[2] = max(float(new_pose[2]), MIN_TCP_Z)
                 robot.servo_p(new_pose, 0)
+                action_count += 1
+                if action_count % 32 == 0:
+                    print("[Motion] 已执行 16 个动作，暂停 0.5s")
+                    time.sleep(0.05)
 
             # else: 增量为0，不调用 servo_p
 
-            # Btn0 → 切换抓夹（IO：开=0，关=1）
+            # Btn0 → 切换抓夹（使用舵机控制）
             btn0 = spacemouse.is_button_pressed(0)
             if btn0 and not last_btn0:
-                gripper_open = not gripper_open
+                next_gripper_open = not gripper_open
                 try:
-                    robot.set_digital_output(0, 0, 0 if gripper_open else 1)
-                    print("[Gripper]", "打开" if gripper_open else "关闭")
+                    if gripper_controller is not None:
+                        # 使用舵机控制
+                        success = control_gripper(gripper_controller, open=next_gripper_open)
+                        if success:
+                            gripper_open = next_gripper_open
+                            print("[Gripper]", "打开" if gripper_open else "关闭")
+                        else:
+                            print(f"[ERROR] 抓夹切换失败")
+                    else:
+                        # 兼容旧代码：如果没有舵机控制器，尝试使用IO控制
+                        gripper_open = next_gripper_open
+                        robot.set_digital_output(0, 0, 0 if gripper_open else 1)
+                        print("[Gripper]", "打开" if gripper_open else "关闭")
                 except Exception as e:
-                    print(f"[ERROR] 抓夹IO切换失败：{e}")
+                    print(f"[ERROR] 抓夹切换失败：{e}")
             last_btn0 = btn0
 
             # 机器人状态（用于保存）
@@ -283,10 +445,12 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                 continue
             joint_angles = ret[1]
             tcp_pose = robot.get_tcp_position()
+            current_gripper_int = 0 if gripper_open else 1
             if new_pose is not None:
                 print("save_count:", save_count)
                 print(tcp_pose[1])
                 print(new_pose)
+                print("gripper:", current_gripper_int)
             tcp_data = tcp_pose[1] if tcp_pose[0] == 0 else None
 
             # 转 numpy & 可视化深度
@@ -311,7 +475,13 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
             # 叠加状态提示：抓夹与旋转使能
             cv2.putText(combined_image, f"Gripper: {'OPEN(0)' if gripper_open else 'CLOSED(1)'} (Btn0 toggle)",
                         (10, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(combined_image, f"Rotation: {'ENABLED' if rotation_enabled else 'LOCKED'} (toggle Btn1/R)",
+            if rotation_mode == 0:
+                rotation_status = "LOCKED"
+            elif rotation_mode == 1:
+                rotation_status = "RZ_ONLY"
+            else:
+                rotation_status = "FULL(rx,ry,rz)"
+            cv2.putText(combined_image, f"Rotation: {rotation_status} (Btn1 cycle)",
                         (10, 445), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
             cv2.imshow('Dual RealSense D435i Feeds', combined_image)
@@ -328,8 +498,6 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                 d1_vis_256 = cv2.resize(depth_image_1, DEPTH_SIZE, interpolation=cv2.INTER_NEAREST)
                 c2_rgb_256 = cv2.resize(color_image_2, RGB_SIZE, interpolation=cv2.INTER_AREA)
                 d2_vis_256 = cv2.resize(depth_image_2, DEPTH_SIZE, interpolation=cv2.INTER_NEAREST)
-
-                current_gripper_int = 0 if gripper_open else 1
 
                 # === 修改后的保存条件 ===
                 if not first_saved_in_episode:
@@ -386,6 +554,7 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                 max_episode_num = get_next_episode_number(dataset_root)
                 frame_count = 0
                 save_count = 0
+                action_count = 0
                 # 重置去重状态
                 last_saved_tcp = None
                 last_saved_gripper = None
@@ -393,7 +562,8 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                 print(f"正在采集第 {max_episode_num} 条轨迹（已重置计数）")
 
                 # 开始新一条采集前，回到初始位姿
-                gripper_open = move_robot_to_home(robot)
+                move_robot_to_home(robot, gripper_controller)
+                gripper_open = True  # 重置抓夹状态为打开
 
             if key == ord('r'):
                 # 重新收集当前这条轨迹（不递增 episode 号）：清空当前 episode 已采集的数据并复位
@@ -405,18 +575,17 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
                 # 计数与去重状态全部复位
                 frame_count = 0
                 save_count = 0
+                action_count = 0
                 last_saved_tcp = None
                 last_saved_gripper = None
                 first_saved_in_episode = False
 
                 # 回到初始位姿，重新开始本 episode
-                try:
-                    gripper_open = move_robot_to_home(robot)
-                except Exception as e:
-                    print(f"[Redo][WARN] 回初始位姿失败：{e}")
+
+                move_robot_to_home(robot, gripper_controller)
+                gripper_open = True  # 重置抓夹状态为打开
 
                 print(f"[Redo] 已重置并准备重新采集第 {max_episode_num} 条轨迹")
-
 
             # 控制频率：睡眠补偿
             elapsed_time = time.time() - start_time
@@ -457,6 +626,13 @@ def main(output_folder="data", control_hz=20, save_hz=10, continue_getdata=False
         except Exception:
             pass
         try:
+            # 断开抓夹舵机连接
+            if gripper_controller is not None:
+                gripper_controller.disconnect()
+                print("[Gripper] 抓夹舵机已断开连接")
+        except Exception as e:
+            print(f"[WARN] 断开抓夹舵机连接失败：{e}")
+        try:
             robot.logout()
         except Exception:
             pass
@@ -470,16 +646,27 @@ if __name__ == "__main__":
     # 兼容旧参数：--target_fps 等价于 --control_hz
     parser.add_argument("--target_fps", type=int, help="【兼容参数】控制频率（等价于 --control_hz）", default=None)
 
-    parser.add_argument("--control_hz", type=int, help="控制频率（Hz）", default=20)
-    parser.add_argument("--save_hz", type=int, help="保存频率（Hz）", default=10)
+    parser.add_argument("--control_hz", type=int, help="控制频率（Hz）", default=15)
+    parser.add_argument("--save_hz", type=int, help="保存频率（Hz）", default=15)
+
 
     # 为了更稳妥地接收布尔类型，这里将字符串 true/false 映射为布尔
     def str2bool(v):
         if isinstance(v, bool):
             return v
         return v.lower() in ('1', 'true', 't', 'yes', 'y')
+
+
     parser.add_argument("--continue_getdata", type=str2bool, nargs='?', const=True, default=False,
                         help="是否继续获取数据（True/False）")
+
+    # 抓夹舵机相关参数
+    parser.add_argument("--gripper_port", type=str, default='/dev/ttyUSB0',
+                        help="抓夹舵机串口号（Windows下如 'COM3', Linux下如 '/dev/ttyUSB0'）")
+    parser.add_argument("--gripper_baudrate", type=int, default=1000000,
+                        help="抓夹舵机串口波特率（默认: 1000000）")
+    parser.add_argument("--gripper_servo_ids", type=int, nargs='+', default=[1],
+                        help="抓夹舵机ID列表（默认: [1]）")
 
     args = parser.parse_args()
 
@@ -490,4 +677,7 @@ if __name__ == "__main__":
     main(output_folder=args.output_folder,
          control_hz=args.control_hz,
          save_hz=args.save_hz,
-         continue_getdata=args.continue_getdata)
+         continue_getdata=args.continue_getdata,
+         gripper_port=args.gripper_port,
+         gripper_baudrate=args.gripper_baudrate,
+         gripper_servo_ids=args.gripper_servo_ids)
